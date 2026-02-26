@@ -1,5 +1,6 @@
 ﻿<script>
   import { Chess } from "chess.js";
+  import { tick } from "svelte";
 
   const lichessPieceBase = "https://lichess1.org/assets/piece/cburnett";
 
@@ -16,6 +17,9 @@
   let error = "";
   let lastMove = null;
   let moveRows = [];
+  let legalMoves = [];
+  let movingPiece = null;
+  let checkedKingSquare = null;
 
   function squareName(row, col) {
     return `${files[col]}${ranks[row]}`;
@@ -26,6 +30,7 @@
     const history = game.history({ verbose: true });
     lastMove = history.length ? history[history.length - 1] : null;
     moveRows = movePairsFromSan(game.history());
+    checkedKingSquare = findCheckedKingSquare();
   }
 
   function pieceImage(square) {
@@ -35,13 +40,9 @@
     return `${lichessPieceBase}/${color}${type}.svg`;
   }
 
-  function tryMove(from, to) {
-    const move = game.move({ from, to, promotion: "q" });
-    if (!move) return false;
-    refresh();
-    selected = null;
-    error = "";
-    return true;
+  async function tryMove(from, to) {
+    const move = await applyMoveAnimated({ from, to, promotion: "q" });
+    return Boolean(move);
   }
 
   async function askModelMove() {
@@ -62,8 +63,7 @@
 
       const data = await response.json();
       if (!data.game_over && data.model_move) {
-        game.move(data.model_move);
-        refresh();
+        await applyMoveAnimated(data.model_move);
       }
     } catch (e) {
       error = `Backend Fehler: ${e.message}`;
@@ -74,7 +74,7 @@
 
   async function onPlayerMove(from, to) {
     if (busy || game.isGameOver()) return;
-    if (!tryMove(from, to)) {
+    if (!(await tryMove(from, to))) {
       error = `Illegaler Zug: ${from}${to}`;
       return;
     }
@@ -84,23 +84,37 @@
 
   function clickSquare(sq) {
     if (busy || game.isGameOver()) return;
+    const legalTarget = getLegalMoveTarget(sq);
 
     if (!selected) {
       const piece = game.get(sq);
       if (!piece) return;
       const turn = game.turn();
       if (piece.color !== turn) return;
-      selected = sq;
+      setSelection(sq);
       return;
     }
 
     if (selected === sq) {
-      selected = null;
+      clearSelection();
+      return;
+    }
+
+    if (legalTarget) {
+      const from = selected;
+      clearSelection();
+      onPlayerMove(from, sq);
+      return;
+    }
+
+    const piece = game.get(sq);
+    if (piece && piece.color === game.turn()) {
+      setSelection(sq);
       return;
     }
 
     const from = selected;
-    selected = null;
+    clearSelection();
     onPlayerMove(from, sq);
   }
 
@@ -124,7 +138,7 @@
   function resetGame() {
     game.reset();
     refresh();
-    selected = null;
+    clearSelection();
     error = "";
   }
 
@@ -133,7 +147,7 @@
     const undone = game.undo();
     if (!undone) return;
     refresh();
-    selected = null;
+    clearSelection();
     error = "";
   }
 
@@ -154,11 +168,6 @@
     return "Spiel beendet.";
   }
 
-  function movePairs() {
-    const history = game.history();
-    return movePairsFromSan(history);
-  }
-
   function movePairsFromSan(history) {
     const pairs = [];
     for (let i = 0; i < history.length; i += 2) {
@@ -169,6 +178,104 @@
       });
     }
     return pairs;
+  }
+
+  function setSelection(sq) {
+    selected = sq;
+    legalMoves = game.moves({ square: sq, verbose: true }).map((move) => ({
+      to: move.to,
+      isCapture: Boolean(move.captured)
+    }));
+  }
+
+  function clearSelection() {
+    selected = null;
+    legalMoves = [];
+  }
+
+  function getLegalMoveTarget(sq) {
+    for (const move of legalMoves) {
+      if (move.to === sq) return move;
+    }
+    return null;
+  }
+
+  function isCheckNow() {
+    if (typeof game.isCheck === "function") return game.isCheck();
+    if (typeof game.inCheck === "function") return game.inCheck();
+    return false;
+  }
+
+  function findCheckedKingSquare() {
+    if (!isCheckNow()) return null;
+    const colorInCheck = game.turn();
+    for (let r = 0; r < board.length; r += 1) {
+      for (let c = 0; c < board[r].length; c += 1) {
+        const piece = board[r][c];
+        if (piece && piece.type === "k" && piece.color === colorInCheck) {
+          return squareName(r, c);
+        }
+      }
+    }
+    return null;
+  }
+
+  function squareCoords(sq) {
+    const file = sq[0];
+    const rank = Number(sq[1]);
+    return {
+      col: files.indexOf(file),
+      row: ranks.indexOf(rank)
+    };
+  }
+
+  function sleep(ms) {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  function isMovingSourceSquare(sq) {
+    return Boolean(movingPiece && movingPiece.from === sq);
+  }
+
+  async function animateMove(from, to) {
+    const piece = game.get(from);
+    if (!piece) return;
+
+    const fromPos = squareCoords(from);
+    const toPos = squareCoords(to);
+    if (fromPos.row < 0 || fromPos.col < 0 || toPos.row < 0 || toPos.col < 0) return;
+
+    movingPiece = {
+      from,
+      src: pieceImage(piece),
+      row: fromPos.row,
+      col: fromPos.col,
+      dx: toPos.col - fromPos.col,
+      dy: toPos.row - fromPos.row,
+      active: false
+    };
+
+    await tick();
+    requestAnimationFrame(() => {
+      if (movingPiece) movingPiece = { ...movingPiece, active: true };
+    });
+    await sleep(180);
+    movingPiece = null;
+  }
+
+  async function applyMoveAnimated(moveInput) {
+    const probe = new Chess(game.fen());
+    const parsedMove = probe.move(moveInput);
+    if (!parsedMove) return null;
+
+    await animateMove(parsedMove.from, parsedMove.to);
+    const move = game.move(moveInput);
+    if (!move) return null;
+
+    refresh();
+    clearSelection();
+    error = "";
+    return move;
   }
 
   refresh();
@@ -194,13 +301,15 @@
           {@const sq = squareName(r, c)}
           {@const isLastFrom = lastMove && lastMove.from === sq}
           {@const isLastTo = lastMove && lastMove.to === sq}
+          {@const legalTarget = getLegalMoveTarget(sq)}
+          {@const isCheckedKing = checkedKingSquare === sq}
           <button
-            class="square {(r + c) % 2 === 0 ? 'light' : 'dark'} {selected === sq ? 'selected' : ''} {isLastFrom ? 'last-from' : ''} {isLastTo ? 'last-to' : ''}"
+            class="square {(r + c) % 2 === 0 ? 'light' : 'dark'} {selected === sq ? 'selected' : ''} {isLastFrom ? 'last-from' : ''} {isLastTo ? 'last-to' : ''} {legalTarget && !legalTarget.isCapture ? 'legal-target' : ''} {legalTarget && legalTarget.isCapture ? 'legal-capture' : ''} {isCheckedKing ? 'checked-king' : ''}"
             on:click={() => clickSquare(sq)}
             on:dragover={(e) => e.preventDefault()}
             on:drop={(e) => onDrop(e, sq)}
           >
-            {#if square}
+            {#if square && !isMovingSourceSquare(sq)}
               <img
                 class="piece-image"
                 src={pieceImage(square)}
@@ -212,6 +321,15 @@
           </button>
         {/each}
       {/each}
+
+      {#if movingPiece}
+        <img
+          class="moving-piece {movingPiece.active ? 'active' : ''}"
+          src={movingPiece.src}
+          alt="moving chess piece"
+          style="--row: {movingPiece.row}; --col: {movingPiece.col}; --dx: {movingPiece.dx}; --dy: {movingPiece.dy};"
+        />
+      {/if}
     </div>
 
     <aside class="moves-panel">
@@ -262,10 +380,13 @@
   }
 
   .board {
+    position: relative;
     display: grid;
     grid-template-columns: repeat(8, minmax(36px, 72px));
     width: fit-content;
-    border: 1px solid #7a6a55;
+    overflow: hidden;
+    border: none;
+    border-radius: 16px;
   }
 
   .game-layout {
@@ -288,7 +409,7 @@
 
   .light { background: #f0d9b5; }
   .dark { background: #b58863; }
-  .selected { outline: 3px solid #1976d2; z-index: 1; }
+  .selected { background: #829769; }
   .square.last-from::after,
   .square.last-to::after {
     content: "";
@@ -300,6 +421,34 @@
   .square.last-from::after { background: #AAA23A }
   .square.last-to::after { background: #AAA23A }
 
+  .square.legal-target::before,
+  .square.legal-capture::before {
+    content: "";
+    position: absolute;
+    pointer-events: none;
+    z-index: 2;
+  }
+
+  .square.legal-target::before {
+    width: 28%;
+    height: 28%;
+    border-radius: 999px;
+    background: #829769;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+  }
+
+  .square.legal-capture::before {
+    inset: 10%;
+    border-radius: 999px;
+    border: 4px solid #829769;
+  }
+
+  .square.checked-king {
+    box-shadow: inset 0 0 0 3px rgba(198, 40, 40, 0.95), inset 0 0 18px rgba(198, 40, 40, 0.7);
+  }
+
   .piece-image {
     position: relative;
     z-index: 1;
@@ -308,6 +457,24 @@
     object-fit: contain;
     user-select: none;
     -webkit-user-drag: element;
+  }
+
+  .moving-piece {
+    position: absolute;
+    z-index: 3;
+    width: 12.5%;
+    height: 12.5%;
+    left: calc(var(--col) * 12.5%);
+    top: calc(var(--row) * 12.5%);
+    padding: 0.7%;
+    box-sizing: border-box;
+    pointer-events: none;
+    transform: translate(0, 0);
+    transition: transform 180ms cubic-bezier(0.2, 0, 0.2, 1);
+  }
+
+  .moving-piece.active {
+    transform: translate(calc(var(--dx) * 100%), calc(var(--dy) * 100%));
   }
 
   .controls {
