@@ -1,0 +1,7 @@
+﻿fastapi>=0.112.0
+uvicorn[standard]>=0.30.0
+python-chess>=1.999
+transformers>=4.40.0
+torch>=2.1.0
+huggingface_hub>=0.23.0
+requests>=2.31.0
